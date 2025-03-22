@@ -25,7 +25,7 @@ A command-line utility to streamline Jekyll development using Docker, removing t
 1. Download the script:
 
 ```bash
-curl -o jex.sh https://raw.githubusercontent.com/yourusername/jex/main/jex.sh
+curl -o jex.sh https://raw.githubusercontent.com/Rynaro/jex/main/jex.sh
 ```
 
 2. Make it executable:
