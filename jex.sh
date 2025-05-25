@@ -7,10 +7,16 @@
 # CONFIGURATION
 # ======================================================
 
-JEX_VERSION="1.0.0"
-DOCKER_IMAGE="jekyll-site"
+JEX_VERSION="1.1.0"
+DOCKER_IMAGE="jex"
+
+JEX_CONTAINER_NAME="jex-jekyll-app"
 JEX_DIR="${HOME}/.jex"
 JEX_CONFIG="${JEX_DIR}/config"
+JEKYLL_FOLDER_LOCATION="/opt/site"
+JEX_USER="jex"
+
+JEKYLL_PORT=4000
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -29,46 +35,85 @@ function ensure_jex_dir() {
   if [ ! -d "${JEX_DIR}" ]; then
     mkdir -p "${JEX_DIR}"
     mkdir -p "${JEX_DIR}/templates"
-    
+
     # Create default config if it doesn't exist
     if [ ! -f "${JEX_CONFIG}" ]; then
       cat > "${JEX_CONFIG}" << EOF
-DOCKER_IMAGE="jekyll-site"
-JEKYLL_PORT=4000
+DOCKER_IMAGE="${DOCKER_IMAGE}"
+JEX_CONTAINER_NAME="${JEX_CONTAINER_NAME}"
+JEKYLL_FOLDER_LOCATION="${JEKYLL_FOLDER_LOCATION}"
+JEX_USER="${JEX_USER}"
+JEKYLL_PORT="${JEKYLL_PORT}"
 # Default user/group IDs (will be overridden at runtime)
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
 EOF
     fi
-    
-    # Create Dockerfile template
-    cat > "${JEX_DIR}/templates/Dockerfile" << 'EOF'
-FROM ruby:3.2-slim
 
-# Install dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    git \
-    nodejs \
-    npm \
-    && apt-get clean \
+    # Create Dockerfile template
+    cat > "${JEX_DIR}/templates/Dockerfile" << EOF
+# Build stage
+FROM ruby:3.3-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \\
+    build-essential \\
+    git \\
+    nodejs \\
+    npm \\
     && rm -rf /var/lib/apt/lists/*
 
+# Create a non-root user
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+RUN groupadd -g \${GROUP_ID} ${JEX_USER} && \\
+    useradd -u \${USER_ID} -g ${JEX_USER} -m -s /bin/bash ${JEX_USER}
+
 # Set working directory
-WORKDIR /site
+RUN mkdir -p ${JEKYLL_FOLDER_LOCATION}
+WORKDIR ${JEKYLL_FOLDER_LOCATION}
 
 # Install Jekyll and Bundler
+USER ${JEX_USER}
 RUN gem install jekyll bundler webrick
+
+# Final stage
+FROM ruby:3.3-slim
+
+# Install runtime dependencies and build tools
+RUN apt-get update && apt-get install -y \\
+    git \\
+    nodejs \\
+    build-essential \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+RUN groupadd -g \${GROUP_ID} ${JEX_USER} && \\
+    useradd -u \${USER_ID} -g ${JEX_USER} -m -s /bin/bash ${JEX_USER} && \\
+    mkdir -p /usr/local/bundle && \\
+    chown -R ${JEX_USER}:${JEX_USER} /usr/local/bundle
+
+# Set working directory
+WORKDIR ${JEKYLL_FOLDER_LOCATION}
+RUN chown -R ${JEX_USER}:${JEX_USER} ${JEKYLL_FOLDER_LOCATION}
+
+# Copy gems from builder
+COPY --from=builder --chown=${JEX_USER}:${JEX_USER} /usr/local/bundle /usr/local/bundle
+
+# Switch to non-root user
+USER ${JEX_USER}
 
 # Expose port 4000 for Jekyll server
 EXPOSE 4000
 
 # Add volume for site content
-VOLUME /site
+VOLUME ${JEKYLL_FOLDER_LOCATION}
 
 # Command to run when container starts
 # Using webrick since it's no longer bundled with Ruby 3.0+
-CMD ["sh", "-c", "if [ ! -f Gemfile ]; then jekyll new . --force; fi && bundle install && bundle exec jekyll serve --host 0.0.0.0 --livereload"]
+CMD ["sh", "-c", "if [ ! -f Gemfile ]; then jekyll new . --force; fi && bundle install --path /usr/local/bundle && bundle exec jekyll serve --host 0.0.0.0 --livereload"]
 EOF
 
     # Create gitignore template
@@ -101,9 +146,9 @@ function fix_permissions() {
   local dir=${1:-.}
   USER_ID=$(id -u)
   GROUP_ID=$(id -g)
-  
+
   echo -e "${YELLOW}Fixing file permissions in $dir...${NC}"
-  
+
   # Check if we need sudo (if files are owned by root)
   if [ -f "$dir/_config.yml" ] && [ $(stat -c "%u" "$dir/_config.yml") -ne $USER_ID ]; then
     # Try with sudo
@@ -133,16 +178,16 @@ function load_config() {
 # Build the Docker image
 function image_build() {
   echo -e "${BLUE}Building Jekyll Docker image...${NC}"
-  run_cmd "docker build -t $DOCKER_IMAGE ."
+  run_cmd "docker build -t ${DOCKER_IMAGE} ."
 }
 
-# Remove Docker image 
+# Remove Docker image
 function image_remove() {
   echo -e "${RED}Warning: This will remove the Jekyll Docker image.${NC}"
   echo -e "${YELLOW}Do you want to continue? (y/n)${NC}"
   read -r answer
   if [[ "$answer" =~ ^[Yy]$ ]]; then
-    run_cmd "docker rmi $DOCKER_IMAGE"
+    run_cmd "docker rmi ${DOCKER_IMAGE}"
     echo -e "${GREEN}Image removed.${NC}"
   else
     echo -e "${BLUE}Operation canceled.${NC}"
@@ -156,17 +201,13 @@ function image_remove() {
 # Start Jekyll server with live reload
 function container_serve() {
   echo -e "${BLUE}Starting Jekyll server with live reload...${NC}"
-  USER_ID=$(id -u)
-  GROUP_ID=$(id -g)
-  run_cmd "docker run --rm -v $(pwd):/site -u $USER_ID:$GROUP_ID -p ${JEKYLL_PORT:-4000}:4000 $DOCKER_IMAGE"
+  run_cmd "docker run --rm -v $(pwd):${JEKYLL_FOLDER_LOCATION} -p ${JEKYLL_PORT:-4000}:4000 ${DOCKER_IMAGE}"
 }
 
 # Run Jekyll server in background
 function container_serve_detached() {
   echo -e "${BLUE}Starting Jekyll server in detached mode...${NC}"
-  USER_ID=$(id -u)
-  GROUP_ID=$(id -g)
-  run_cmd "docker run -d --name jekyll-container -v $(pwd):/site -u $USER_ID:$GROUP_ID -p ${JEKYLL_PORT:-4000}:4000 $DOCKER_IMAGE"
+  run_cmd "docker run -d --name ${JEX_CONTAINER_NAME} -v $(pwd):${JEKYLL_FOLDER_LOCATION} -p ${JEKYLL_PORT:-4000}:4000 ${DOCKER_IMAGE}"
   echo -e "${GREEN}Server running at http://localhost:${JEKYLL_PORT:-4000}${NC}"
   echo -e "${YELLOW}To stop server: ./jex.sh stop${NC}"
 }
@@ -174,7 +215,7 @@ function container_serve_detached() {
 # Stop detached Jekyll server
 function container_stop() {
   echo -e "${BLUE}Stopping Jekyll server...${NC}"
-  run_cmd "docker stop jekyll-container && docker rm jekyll-container"
+  run_cmd "docker stop ${JEX_CONTAINER_NAME} && docker rm ${JEX_CONTAINER_NAME}"
 }
 
 # Run a command inside the Jekyll container
@@ -183,12 +224,8 @@ function container_exec() {
     error_exit "Please provide a command to execute"
   fi
 
-  # Get current user and group IDs
-  USER_ID=$(id -u)
-  GROUP_ID=$(id -g)
-
   echo -e "${BLUE}Executing command in Jekyll container...${NC}"
-  run_cmd "docker run --rm -v $(pwd):/site -u $USER_ID:$GROUP_ID $DOCKER_IMAGE sh -c \"$1\""
+  run_cmd "docker run --rm -v $(pwd):${JEKYLL_FOLDER_LOCATION} ${DOCKER_IMAGE} sh -c \"$1\""
 }
 
 # Clean up all Jekyll Docker containers
@@ -197,8 +234,8 @@ function container_clean() {
   echo -e "${YELLOW}Do you want to continue? (y/n)${NC}"
   read -r answer
   if [[ "$answer" =~ ^[Yy]$ ]]; then
-    run_cmd "docker stop jekyll-container 2>/dev/null || true"
-    run_cmd "docker rm jekyll-container 2>/dev/null || true"
+    run_cmd "docker stop ${JEX_CONTAINER_NAME} 2>/dev/null || true"
+    run_cmd "docker rm ${JEX_CONTAINER_NAME} 2>/dev/null || true"
     echo -e "${GREEN}Containers cleaned up.${NC}"
   else
     echo -e "${BLUE}Clean up canceled.${NC}"
@@ -226,18 +263,16 @@ function project_init() {
   fi
 
   # Build image if it doesn't exist
-  if ! docker image inspect $DOCKER_IMAGE >/dev/null 2>&1; then
+  if ! docker image inspect ${DOCKER_IMAGE} >/dev/null 2>&1; then
     image_build
   fi
 
   # Create a new Jekyll site directly in the current directory
-  # We'll run Jekyll as the current user to ensure correct file ownership
+  run_cmd "docker run --rm -v $(pwd):${JEKYLL_FOLDER_LOCATION} ${DOCKER_IMAGE} sh -c \"jekyll new . --force && bundle install\""
+
+  # Fix ownership of created files
   USER_ID=$(id -u)
   GROUP_ID=$(id -g)
-
-  run_cmd "docker run --rm -v $(pwd):/site -u $USER_ID:$GROUP_ID $DOCKER_IMAGE sh -c \"jekyll new . --force && bundle install\"" 
-
-  # If files are still created as root, fix ownership
   if [ -f "_config.yml" ] && [ $(stat -c "%u" _config.yml) -ne $USER_ID ]; then
     echo -e "${YELLOW}Fixing file ownership...${NC}"
     run_cmd "sudo chown -R $USER_ID:$GROUP_ID ."
